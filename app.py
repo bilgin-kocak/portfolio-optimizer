@@ -7,6 +7,11 @@ import plotly.express as px
 from datetime import datetime, timedelta
 from scipy.optimize import minimize
 import warnings
+import time
+import pytz
+import requests
+import json
+import os
 warnings.filterwarnings('ignore')
 
 st.set_page_config(
@@ -14,6 +19,10 @@ st.set_page_config(
     page_icon="📊",
     layout="wide"
 )
+
+# Configure yfinance settings
+os.environ['YFINANCE_CACHE_DIR'] = os.path.join(os.path.expanduser("~"), ".yfinance_cache")
+yf.pdr_override()
 
 st.title("📊 Portfolio Optimizer")
 st.markdown("Build and analyze your investment portfolio using Modern Portfolio Theory")
@@ -25,15 +34,116 @@ POPULAR_ASSETS = {
     "Commodities": ["GC=F", "SI=F", "CL=F"]  # Gold, Silver, Oil futures
 }
 
+@st.cache_data(ttl=3600)
 def fetch_data(tickers, start_date, end_date):
-    """Fetch historical data for given tickers"""
-    try:
-        data = yf.download(tickers, start=start_date, end=end_date)['Adj Close']
-        if isinstance(data, pd.Series):
-            data = data.to_frame()
-        return data
-    except Exception as e:
-        st.error(f"Error fetching data: {str(e)}")
+    """Fetch historical data for given tickers with robust error handling"""
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    
+    # Set cache directory for yfinance
+    cache_dir = os.path.join(os.path.expanduser("~"), ".yfinance_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    successful_data = {}
+    failed_tickers = []
+    
+    for ticker in tickers:
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                # Convert dates to timezone-aware datetime objects
+                if isinstance(start_date, str):
+                    start_date = datetime.strptime(start_date, "%Y-%m-%d")
+                if isinstance(end_date, str):
+                    end_date = datetime.strptime(end_date, "%Y-%m-%d")
+                
+                # Add timezone info if missing
+                if start_date.tzinfo is None:
+                    start_date = pytz.UTC.localize(start_date)
+                if end_date.tzinfo is None:
+                    end_date = pytz.UTC.localize(end_date)
+                
+                # Create ticker object with session
+                ticker_obj = yf.Ticker(ticker)
+                
+                # Fetch data with specific parameters
+                data = ticker_obj.history(
+                    start=start_date,
+                    end=end_date,
+                    auto_adjust=True,
+                    back_adjust=False,
+                    repair=True,
+                    keepna=False,
+                    actions=False,
+                    rounding=2
+                )
+                
+                if not data.empty and len(data) > 10:  # Ensure we have enough data
+                    # Use 'Close' column instead of 'Adj Close'
+                    if 'Close' in data.columns:
+                        successful_data[ticker] = data['Close']
+                    else:
+                        # Fallback to any price column available
+                        price_columns = [col for col in data.columns if col.lower() in ['close', 'adj close', 'price']]
+                        if price_columns:
+                            successful_data[ticker] = data[price_columns[0]]
+                        else:
+                            raise ValueError(f"No price data found for {ticker}")
+                    
+                    break  # Success, exit retry loop
+                else:
+                    raise ValueError(f"Insufficient data for {ticker}")
+                    
+            except Exception as e:
+                error_msg = str(e).lower()
+                
+                if attempt < max_retries - 1:
+                    if "json" in error_msg or "expecting value" in error_msg:
+                        # JSON decode error - wait and retry
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    elif "timezone" in error_msg or "delisted" in error_msg:
+                        # Try alternative approach
+                        try:
+                            # Alternative data fetching approach
+                            alt_data = yf.download(
+                                ticker,
+                                start=start_date.strftime("%Y-%m-%d"),
+                                end=end_date.strftime("%Y-%m-%d"),
+                                progress=False,
+                                show_errors=False
+                            )
+                            if not alt_data.empty and 'Adj Close' in alt_data.columns:
+                                successful_data[ticker] = alt_data['Adj Close']
+                                break
+                        except:
+                            pass
+                else:
+                    # All retries failed
+                    failed_tickers.append(ticker)
+                    print(f"Failed to fetch {ticker}: {str(e)}")
+    
+    # Display results
+    if successful_data:
+        result_df = pd.DataFrame(successful_data)
+        result_df = result_df.dropna()  # Remove rows with NaN values
+        
+        if failed_tickers:
+            st.warning(f"⚠️ Could not fetch data for: {', '.join(failed_tickers)}")
+            st.info(f"✅ Successfully loaded: {', '.join(successful_data.keys())}")
+        
+        return result_df
+    else:
+        st.error("❌ Failed to fetch data for any selected tickers. Please try:")
+        st.markdown("""
+        - Check if tickers are correct (e.g., AAPL, GOOGL)
+        - Try a different date range
+        - Refresh the page and try again
+        - Check your internet connection
+        """)
         return None
 
 def calculate_portfolio_stats(returns, weights):
