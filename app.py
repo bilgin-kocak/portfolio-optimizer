@@ -8,10 +8,6 @@ from datetime import datetime, timedelta
 from scipy.optimize import minimize
 import warnings
 import time
-import pytz
-import requests
-import json
-import os
 warnings.filterwarnings('ignore')
 
 st.set_page_config(
@@ -19,10 +15,6 @@ st.set_page_config(
     page_icon="📊",
     layout="wide"
 )
-
-# Configure yfinance settings
-os.environ['YFINANCE_CACHE_DIR'] = os.path.join(os.path.expanduser("~"), ".yfinance_cache")
-yf.pdr_override()
 
 st.title("📊 Portfolio Optimizer")
 st.markdown("Build and analyze your investment portfolio using Modern Portfolio Theory")
@@ -34,116 +26,157 @@ POPULAR_ASSETS = {
     "Commodities": ["GC=F", "SI=F", "CL=F"]  # Gold, Silver, Oil futures
 }
 
+def validate_ticker(ticker):
+    """Validate ticker format and common patterns"""
+    if not ticker or not isinstance(ticker, str):
+        return False
+    
+    ticker = ticker.upper().strip()
+    
+    # Basic validation - should be 1-5 characters for stocks, longer for other assets
+    if len(ticker) < 1 or len(ticker) > 10:
+        return False
+    
+    # Check for common patterns
+    invalid_chars = [' ', '<', '>', '&', '"', "'", '\\', '/', '?', '#']
+    if any(char in ticker for char in invalid_chars):
+        return False
+    
+    return True
+
 @st.cache_data(ttl=3600)
 def fetch_data(tickers, start_date, end_date):
-    """Fetch historical data for given tickers with robust error handling"""
+    """Fetch historical data using yf.download() - simplified and stable approach"""
     if isinstance(tickers, str):
         tickers = [tickers]
     
-    # Set cache directory for yfinance
-    cache_dir = os.path.join(os.path.expanduser("~"), ".yfinance_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    successful_data = {}
-    failed_tickers = []
+    # Validate tickers first
+    valid_tickers = []
+    invalid_tickers = []
     
     for ticker in tickers:
-        max_retries = 3
-        retry_delay = 1
-        
-        for attempt in range(max_retries):
-            try:
-                # Convert dates to timezone-aware datetime objects
-                if isinstance(start_date, str):
-                    start_date = datetime.strptime(start_date, "%Y-%m-%d")
-                if isinstance(end_date, str):
-                    end_date = datetime.strptime(end_date, "%Y-%m-%d")
-                
-                # Add timezone info if missing
-                if start_date.tzinfo is None:
-                    start_date = pytz.UTC.localize(start_date)
-                if end_date.tzinfo is None:
-                    end_date = pytz.UTC.localize(end_date)
-                
-                # Create ticker object with session
-                ticker_obj = yf.Ticker(ticker)
-                
-                # Fetch data with specific parameters
-                data = ticker_obj.history(
-                    start=start_date,
-                    end=end_date,
-                    auto_adjust=True,
-                    back_adjust=False,
-                    repair=True,
-                    keepna=False,
-                    actions=False,
-                    rounding=2
-                )
-                
-                if not data.empty and len(data) > 10:  # Ensure we have enough data
-                    # Use 'Close' column instead of 'Adj Close'
-                    if 'Close' in data.columns:
-                        successful_data[ticker] = data['Close']
-                    else:
-                        # Fallback to any price column available
-                        price_columns = [col for col in data.columns if col.lower() in ['close', 'adj close', 'price']]
-                        if price_columns:
-                            successful_data[ticker] = data[price_columns[0]]
-                        else:
-                            raise ValueError(f"No price data found for {ticker}")
-                    
-                    break  # Success, exit retry loop
-                else:
-                    raise ValueError(f"Insufficient data for {ticker}")
-                    
-            except Exception as e:
-                error_msg = str(e).lower()
-                
-                if attempt < max_retries - 1:
-                    if "json" in error_msg or "expecting value" in error_msg:
-                        # JSON decode error - wait and retry
-                        time.sleep(retry_delay)
-                        retry_delay *= 2
-                        continue
-                    elif "timezone" in error_msg or "delisted" in error_msg:
-                        # Try alternative approach
-                        try:
-                            # Alternative data fetching approach
-                            alt_data = yf.download(
-                                ticker,
-                                start=start_date.strftime("%Y-%m-%d"),
-                                end=end_date.strftime("%Y-%m-%d"),
-                                progress=False,
-                                show_errors=False
-                            )
-                            if not alt_data.empty and 'Adj Close' in alt_data.columns:
-                                successful_data[ticker] = alt_data['Adj Close']
-                                break
-                        except:
-                            pass
-                else:
-                    # All retries failed
-                    failed_tickers.append(ticker)
-                    print(f"Failed to fetch {ticker}: {str(e)}")
+        if validate_ticker(ticker):
+            valid_tickers.append(ticker.upper().strip())
+        else:
+            invalid_tickers.append(ticker)
     
-    # Display results
-    if successful_data:
-        result_df = pd.DataFrame(successful_data)
-        result_df = result_df.dropna()  # Remove rows with NaN values
-        
-        if failed_tickers:
-            st.warning(f"⚠️ Could not fetch data for: {', '.join(failed_tickers)}")
-            st.info(f"✅ Successfully loaded: {', '.join(successful_data.keys())}")
-        
-        return result_df
+    if invalid_tickers:
+        st.warning(f"⚠️ Invalid ticker format: {', '.join(invalid_tickers)}")
+    
+    if not valid_tickers:
+        st.error("❌ No valid tickers to fetch data for!")
+        return None
+    
+    # Convert dates to string format for yf.download()
+    if hasattr(start_date, 'strftime'):
+        start_str = start_date.strftime('%Y-%m-%d')
     else:
-        st.error("❌ Failed to fetch data for any selected tickers. Please try:")
-        st.markdown("""
-        - Check if tickers are correct (e.g., AAPL, GOOGL)
-        - Try a different date range
-        - Refresh the page and try again
-        - Check your internet connection
-        """)
+        start_str = str(start_date)
+    
+    if hasattr(end_date, 'strftime'):
+        end_str = end_date.strftime('%Y-%m-%d')
+    else:
+        end_str = str(end_date)
+    
+    # Try to fetch data with retries
+    max_retries = 3
+    data = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Use yf.download() with threading for better performance
+            data = yf.download(
+                tickers=valid_tickers,
+                start=start_str,
+                end=end_str,
+                progress=False,
+                threads=True if len(valid_tickers) > 1 else False,
+                group_by='ticker' if len(valid_tickers) > 1 else None
+            )
+            
+            if data is not None and not data.empty:
+                break
+            else:
+                raise ValueError("No data returned")
+                
+        except Exception as e:
+            error_msg = str(e).lower()
+            if attempt < max_retries - 1:
+                if "json" in error_msg or "expecting value" in error_msg:
+                    # Wait and retry for JSON decode errors
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+                elif "429" in error_msg or "rate limit" in error_msg:
+                    # Rate limiting - wait longer
+                    time.sleep(5 * (attempt + 1))
+                    continue
+            else:
+                st.error(f"❌ Failed to fetch data after {max_retries} attempts: {str(e)}")
+                return None
+    
+    if data is None or data.empty:
+        st.error("❌ No data received from Yahoo Finance")
+        return None
+    
+    # Process the data based on structure
+    try:
+        if len(valid_tickers) == 1:
+            # Single ticker - data is a simple DataFrame
+            if 'Adj Close' in data.columns:
+                result = data[['Adj Close']].copy()
+                result.columns = valid_tickers
+            elif 'Close' in data.columns:
+                result = data[['Close']].copy()
+                result.columns = valid_tickers
+            else:
+                st.error("❌ No price data found in the response")
+                return None
+        else:
+            # Multiple tickers - data is grouped
+            result = pd.DataFrame()
+            successful_tickers = []
+            failed_tickers = []
+            
+            for ticker in valid_tickers:
+                try:
+                    if ('Adj Close', ticker) in data.columns:
+                        result[ticker] = data[('Adj Close', ticker)]
+                        successful_tickers.append(ticker)
+                    elif ('Close', ticker) in data.columns:
+                        result[ticker] = data[('Close', ticker)]
+                        successful_tickers.append(ticker)
+                    else:
+                        # Try to find ticker data in any form
+                        ticker_cols = [col for col in data.columns if ticker in str(col)]
+                        if ticker_cols:
+                            # Use the first available column for this ticker
+                            result[ticker] = data[ticker_cols[0]]
+                            successful_tickers.append(ticker)
+                        else:
+                            failed_tickers.append(ticker)
+                except Exception:
+                    failed_tickers.append(ticker)
+            
+            if failed_tickers:
+                st.warning(f"⚠️ Could not fetch data for: {', '.join(failed_tickers)}")
+            
+            if successful_tickers:
+                st.success(f"✅ Successfully loaded: {', '.join(successful_tickers)}")
+            
+            if result.empty:
+                st.error("❌ No data could be processed for any ticker")
+                return None
+        
+        # Clean the data
+        result = result.dropna()
+        
+        if len(result) < 10:
+            st.warning("⚠️ Limited data available - results may be less accurate")
+        
+        return result
+        
+    except Exception as e:
+        st.error(f"❌ Error processing data: {str(e)}")
         return None
 
 def calculate_portfolio_stats(returns, weights):
